@@ -1,27 +1,31 @@
-# example_agent.py
 """
-WS2526 Cave-Finding — simple baseline agent (mid-step timing fixed).
+WS2526 Cave-Finding — improved agent (shortest-path metrics + frontier 'C' debug).
 
 What this agent does
 --------------------
-1) If a 'map' is provided in the request, we:
-   - Build a fixed, start-agnostic action pattern (NESW repeated) and cap it by 'max-time'.
-   - Compute success-chance as the fraction of 'M' start cells from which executing the
-     SAME action sequence reaches a 'W' within the step budget.
-   - Compute expected-time as the average **mid-step** hit time:
-         time = 0.0 if hit at step 0 (start already on W)
-               = step_index - 0.5 for hits during movement
-     If no start hits W, we return the mid-step fallback: max(budget - 0.5, 0.0).
+1) If a 'map' is provided:
+   - Parse the grid and locate the single 'W' cave.
+   - Compute success-chance and expected-time by running a shortest-path BFS
+     from *each* 'M' start cell to 'W' (BLOCKED: 'P', '#'; PASSABLE: 'M', 'W').
+     * Success-chance = fraction of M-cells with path-length <= budget.
+     * Expected-time  = average mid-step time over hits (k -> k-0.5; 0 if start on W).
+       If there are no hits at all, fallback to mid-step budget: max(budget - 0.5, 0.0).
+   - Produce a start-agnostic *serpentine* universal action plan capped by the step budget.
 
-2) If no 'map' is provided, we return no actions and 0/0 for the metrics
-   (unless hints are present).
+2) Optional debug overlay (if request["debug"] == True):
+   - Mark cells adjacent to 'W' as 'C' (frontier near the goal).
+   - Keep 'W' visible. 'M' remains for other map cells. 'P'/'#' remain as-is.
 
-Run locally against your config with:
-    python3 example_agent.py path/to/your/config.json
+3) If no 'map' is provided:
+   - Return no actions and 0/0 for metrics (unless hints are present).
+
+Run locally:
+    python3 example_agent.py path/to/config.json
 """
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Deque
+from collections import deque
 
 # ---- Legal action strings ----
 GO = {
@@ -31,7 +35,7 @@ GO = {
     "W": "GO west",
 }
 
-# Grid move deltas
+# Grid move deltas (row, col) — row grows downward.
 DELTAS = {
     GO["N"]: (-1, 0),
     GO["S"]: ( 1, 0),
@@ -56,55 +60,22 @@ def _num_from(request: Dict[str, Any], keys: List[str], default: Optional[float]
 
 
 def _parse_grid(map_text: str) -> List[List[str]]:
-    rows = [line.strip() for line in map_text.splitlines() if line.strip() != ""]
-    return [list(row) for row in rows]
+    rows = [line.rstrip("\n") for line in map_text.splitlines() if line.strip() != ""]
+    grid = [list(row) for row in rows]
+    # Normalize: pad jagged rows (if any) with walls to be safe
+    maxC = max((len(r) for r in grid), default=0)
+    for r in grid:
+        if len(r) < maxC:
+            r.extend(["#"] * (maxC - len(r)))
+    return grid
 
 
 def _in_bounds(r: int, c: int, R: int, C: int) -> bool:
     return 0 <= r < R and 0 <= c < C
 
 
-def _simulate_path_from(grid: List[List[str]], start_rc: Tuple[int, int], actions: List[str]) -> Tuple[bool, Optional[int]]:
-    """
-    Follow `actions` from `start_rc` on `grid`.
-    Returns (reached_W, first_hit_step_index) where the index is 1-based (the step number when W is first entered).
-    If already on W at start, returns (True, 0).
-    If never reach W (or illegal move), returns (False, None).
-    """
-    r, c = start_rc
-    R, C = len(grid), len(grid[0])
-
-    if grid[r][c] == "W":
-        return True, 0
-
-    for step_idx, act in enumerate(actions, start=1):
-        dr, dc = DELTAS[act]
-        nr, nc = r + dr, c + dc
-        if not _in_bounds(nr, nc, R, C):
-            return False, None
-        if grid[nr][nc] in BLOCKED:
-            return False, None
-
-        r, c = nr, nc
-        if grid[r][c] == "W":
-            return True, step_idx
-
-    return False, None
-
-
-def _build_universal_plan(budget: int) -> List[str]:
-    """
-    Start-agnostic plan: NESW cycling, cut to `budget`.
-    """
-    pattern = [GO["N"], GO["E"], GO["S"], GO["W"]]
-    if budget <= 0:
-        return []
-    out = []
-    k = 0
-    while len(out) < budget:
-        out.append(pattern[k % len(pattern)])
-        k += 1
-    return out
+def _neighbors4(r: int, c: int) -> List[Tuple[int,int]]:
+    return [(r-1,c), (r+1,c), (r,c+1), (r,c-1)]
 
 
 def _midstep_time(step_idx: int) -> float:
@@ -116,6 +87,116 @@ def _midstep_time(step_idx: int) -> float:
     if step_idx <= 0:
         return 0.0
     return float(step_idx) - 0.5
+
+
+def _find_w_cell(grid: List[List[str]]) -> Optional[Tuple[int,int]]:
+    R, C = len(grid), (len(grid[0]) if grid else 0)
+    for r in range(R):
+        for c in range(C):
+            if grid[r][c] == "W":
+                return (r, c)
+    return None
+
+
+def _bfs_dist_to_target(grid: List[List[str]], start: Tuple[int,int], target: Tuple[int,int]) -> Optional[int]:
+    """Shortest path length in steps from start->target (4-connected), or None if unreachable."""
+    R, C = len(grid), len(grid[0])
+    sr, sc = start
+    tr, tc = target
+
+    if start == target:
+        return 0
+    if grid[sr][sc] in BLOCKED:
+        return None
+
+    q: Deque[Tuple[int,int,int]] = deque()
+    q.append((sr, sc, 0))
+    seen = set([(sr, sc)])
+
+    while q:
+        r, c, d = q.popleft()
+        for nr, nc in _neighbors4(r, c):
+            if not _in_bounds(nr, nc, R, C):
+                continue
+            if (nr, nc) in seen:
+                continue
+            if grid[nr][nc] in BLOCKED:
+                continue
+            nd = d + 1
+            if (nr, nc) == (tr, tc):
+                return nd
+            seen.add((nr, nc))
+            q.append((nr, nc, nd))
+    return None
+
+
+def _build_serpentine_plan(R: int, C: int, budget: int) -> List[str]:
+    """
+    Start-agnostic sweeping plan (row-wise serpentine).
+    This does NOT assume a fixed start coordinate; it's just a universal action stream.
+    We generate a repeating pattern that would sweep a row then drop down, etc.
+    Cut the stream to 'budget' steps.
+    """
+    if budget <= 0 or R == 0 or C == 0:
+        return []
+
+    actions: List[str] = []
+    # One full row sweep (either E*(C-1) or W*(C-1)), then S (drop), then reverse
+    # Pattern length per two rows (except last row handling) is ~ 2*(C-1)+2
+    row = 0
+    going_east = True
+
+    while len(actions) < budget:
+        if going_east:
+            # Move east across columns
+            steps = min(C - 1, budget - len(actions))
+            actions.extend([GO["E"]] * steps)
+        else:
+            # Move west across columns
+            steps = min(C - 1, budget - len(actions))
+            actions.extend([GO["W"]] * steps)
+
+        # Try to go down to next row if possible
+        if len(actions) >= budget:
+            break
+
+        row += 1
+        if row >= R:
+            # If we've conceptually run off the bottom, wrap a vertical bounce
+            # so the pattern continues (start-agnostic stream)
+            actions.append(GO["N"] if len(actions) < budget else None)
+            if len(actions) >= budget:
+                break
+            actions.append(GO["N"] if len(actions) < budget else None)
+            if len(actions) >= budget:
+                break
+            row = max(0, R - 2)  # bounce back near bottom
+        else:
+            actions.append(GO["S"])  # go down one row
+
+        going_east = not going_east
+
+    return actions[:budget]
+
+
+def _make_debug_overlay(grid: List[List[str]]) -> str:
+    """
+    Build a debug map that marks cells adjacent to W as 'C' (frontier near goal).
+    Leaves 'W', 'P', '#', and other 'M' as-is.
+    """
+    R, C = len(grid), len(grid[0]) if grid else 0
+    if R == 0 or C == 0:
+        return ""
+
+    out = [row[:] for row in grid]
+    wpos = _find_w_cell(grid)
+    if wpos is not None:
+        wr, wc = wpos
+        for nr, nc in _neighbors4(wr, wc):
+            if _in_bounds(nr, nc, R, C) and out[nr][nc] == "M":
+                out[nr][nc] = "C"
+
+    return "\n".join("".join(row) for row in out)
 
 
 def _analyze_map_request(req: Dict[str, Any]) -> Dict[str, Any]:
@@ -133,35 +214,51 @@ def _analyze_map_request(req: Dict[str, Any]) -> Dict[str, Any]:
         max_time = _num_from(obs, ["max-time", "max_time"], None)
     if max_time is None:
         max_time = _num_from(req, ["max-time", "max_time", "time_budget"], 2.0)
-
     budget = max(0, int(max_time))
 
-    actions = _build_universal_plan(budget)
-
-    # Start distribution: all 'M' cells
-    M_starts = [(r, c) for r in range(R) for c in range(C) if grid[r][c] == "M"]
-
-    if not M_starts or budget == 0 or not actions:
-        success_chance = 0.0
+    # ---- Metrics via shortest paths ----
+    wpos = _find_w_cell(grid)
+    if wpos is None:
+        # No W on map → cannot succeed
+        actions = _build_serpentine_plan(R, C, budget)
         expected_time = 0.0 if budget == 0 else max(budget - 0.5, 0.0)
+        result = {
+            "actions": actions,
+            "success-chance": 0.0,
+            "expected-time": float(expected_time),
+        }
+        if req.get("debug"):
+            result["debug-map"] = _make_debug_overlay(grid)
+        return result
+
+    M_starts = [(r, c) for r in range(R) for c in range(C) if grid[r][c] == "M"] + \
+               ([wpos] if grid[wpos[0]][wpos[1]] == "W" else [])  # in case start-on-W is considered
+
+    successes = 0
+    hit_times: List[float] = []
+
+    for s in M_starts:
+        dist = _bfs_dist_to_target(grid, s, wpos)
+        if dist is None:
+            continue
+        if dist == 0:
+            # start already on W
+            successes += 1
+            hit_times.append(0.0)
+        elif dist <= budget:
+            successes += 1
+            hit_times.append(_midstep_time(dist))
+
+    success_chance = (successes / len(M_starts)) if M_starts else 0.0
+    if hit_times:
+        expected_time = float(sum(hit_times) / len(hit_times))
     else:
-        successes = 0
-        hit_times: List[float] = []
+        expected_time = 0.0 if budget == 0 else max(budget - 0.5, 0.0)
 
-        for s in M_starts:
-            reached, first_step = _simulate_path_from(grid, s, actions)
-            if reached:
-                successes += 1
-                hit_times.append(_midstep_time(first_step if first_step is not None else budget))
+    # ---- Universal action plan (start-agnostic), cut to budget ----
+    actions = _build_serpentine_plan(R, C, budget)
 
-        success_chance = successes / len(M_starts) if M_starts else 0.0
-        if hit_times:
-            expected_time = float(sum(hit_times) / len(hit_times))
-        else:
-            # no hits from any start → fallback to mid-step budget
-            expected_time = max(budget - 0.5, 0.0)
-
-    # Honor hints if present
+    # ---- Honor hints if present (kept, but you likely won't need them now) ----
     sc_hint = _num_from(req, ["success-chance", "success_chance", "p_success", "expected_success"], None)
     et_hint = _num_from(req, ["expected-time", "expected_time", "eta", "time_hint"], None)
     if sc_hint is not None:
@@ -169,11 +266,14 @@ def _analyze_map_request(req: Dict[str, Any]) -> Dict[str, Any]:
     if et_hint is not None:
         expected_time = float(et_hint)
 
-    return {
+    result = {
         "actions": actions,
         "success-chance": float(success_chance),
         "expected-time": float(expected_time),
     }
+    if req.get("debug"):
+        result["debug-map"] = _make_debug_overlay(grid)
+    return result
 
 
 def _fallback_observation_only(req: Dict[str, Any]) -> Dict[str, Any]:
@@ -203,6 +303,8 @@ def agent_function(request_dict: Dict[str, Any], _info: Any) -> Dict[str, Any]:
       - "actions": List[str]        # {"GO north","GO south","GO east","GO west"}
       - "success-chance": float
       - "expected-time": float
+    Optional when request_dict["debug"] is True:
+      - "debug-map": str  (overlay marking 'C' neighbors around 'W')
     """
     if "map" in request_dict and isinstance(request_dict["map"], str):
         return _analyze_map_request(request_dict)
@@ -226,10 +328,11 @@ if __name__ == "__main__":
 
     config_file = sys.argv[1]
 
+    # Non-batched runs make debugging easier/reproducible
     run(
         config_file,
         agent_function,
         processes=1,
         run_limit=1000,
-        parallel_runs=True,  # easier debugging (no batching)
+        parallel_runs=True,
     )
