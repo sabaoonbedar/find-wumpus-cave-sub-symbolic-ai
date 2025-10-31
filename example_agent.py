@@ -3,14 +3,13 @@ from typing import List, Tuple, Dict, Any, Optional, Deque
 from collections import deque
 import math
 
-# ----- Actions and movement -----
 GO = {"N": "GO north", "S": "GO south", "E": "GO east", "W": "GO west"}
 DELTAS = {GO["N"]: (-1, 0), GO["S"]: (1, 0), GO["E"]: (0, 1), GO["W"]: (0, -1)}
 
 # In this assignment, '#' is a wall and 'P' is a pit; both are impassable.
 BLOCKED = {"P", "#"}
 
-# ----- Utilities -----
+
 def _num_from(request: Dict[str, Any], keys: List[str], default: Optional[float]) -> Optional[float]:
     for k in keys:
         if k in request:
@@ -40,7 +39,6 @@ def _find_all_w_cells(grid: List[List[str]]) -> List[Tuple[int, int]]:
     C = len(grid[0]) if R else 0
     return [(r, c) for r in range(R) for c in range(C) if grid[r][c] == "W"]
 
-# ----- Distance field (for debug/optional planning) -----
 def _multi_target_dist(grid: List[List[str]]) -> List[List[Optional[int]]]:
     R = len(grid)
     C = len(grid[0]) if R else 0
@@ -73,9 +71,7 @@ def _build_serpentine_plan(R: int, C: int, budget_steps: int) -> List[str]:
 
     actions: List[str] = []
     going_east = True
-    # We do not try to "teleport" between top/bottom; sequence is absolute and will be
-    # applied from whichever unknown start the agent is in.
-    # Just emit a long enough pattern and cut to budget.
+
     row_moves = [GO["E"]] * (C - 1)
     row_moves_rev = [GO["W"]] * (C - 1)
 
@@ -88,7 +84,6 @@ def _build_serpentine_plan(R: int, C: int, budget_steps: int) -> List[str]:
             actions.append(a)
         if len(actions) >= budget_steps:
             break
-        # move down if we can; otherwise we're at the last row and just stop
         if r < R - 1:
             actions.append(GO["S"])
             r += 1
@@ -110,7 +105,6 @@ def _prior_from_observations(grid: List[List[str]], obs: Dict[str, Any]) -> Dict
     """
     R, C = len(grid), len(grid[0]) if grid else 0
 
-    # Helper to collect coords by predicate
     def cells_where(pred) -> List[Tuple[int, int]]:
         out = []
         for r in range(R):
@@ -119,7 +113,6 @@ def _prior_from_observations(grid: List[List[str]], obs: Dict[str, Any]) -> Dict
                     out.append((r, c))
         return out
 
-    # 1) Observed symbol (e.g., "M")
     target_symbol = None
     if isinstance(obs, dict) and "current-cell" in obs:
         target_symbol = str(obs["current-cell"]).strip()
@@ -127,12 +120,10 @@ def _prior_from_observations(grid: List[List[str]], obs: Dict[str, Any]) -> Dict
     if target_symbol is not None:
         candidates = cells_where(lambda r, c: grid[r][c] == target_symbol)
     else:
-        # 2) If any 'M' exists, use M-cells
         m_cells = cells_where(lambda r, c: grid[r][c] == "M")
         if m_cells:
             candidates = m_cells
         else:
-            # 3) Fallback: passable but NOT 'W' (avoid inflating success)
             candidates = cells_where(lambda r, c: grid[r][c] not in BLOCKED and grid[r][c] != "W")
 
     if not candidates:
@@ -141,7 +132,6 @@ def _prior_from_observations(grid: List[List[str]], obs: Dict[str, Any]) -> Dict
     p = 1.0 / len(candidates)
     prior = {rc: p for rc in candidates}
 
-    # Numerical hygiene: renormalize (just in case)
     s = sum(prior.values())
     if s > 0 and abs(s - 1.0) > 1e-12:
         for k in prior:
@@ -171,7 +161,6 @@ def _simulate_plan_success(
     """
     steps = max(0, math.floor(max_time))
     if not prior or steps == 0:
-        # If on W at start can still be success with 0 moves.
         succ_mass = 0.0
         t_weighted = 0.0
         for (sr, sc), p in prior.items():
@@ -187,18 +176,15 @@ def _simulate_plan_success(
 
     for (sr, sc), p in prior.items():
         r, c = sr, sc
-        # Success at t = 0 if already on W
         if grid[r][c] == "W":
             succ_mass += p
             # time = 0.0
             continue
 
         t_hit: Optional[float] = None
-        # simulate moves up to 'steps'
         for t in range(1, steps + 1):
             if t - 1 < len(actions):
                 r, c = _apply_move(grid, r, c, actions[t - 1])
-            # landed on W after this move?
             if grid[r][c] == "W":
                 t_hit = t - 0.5  # mid-step timing
                 break
@@ -223,7 +209,6 @@ def _make_debug_overlay(grid: List[List[str]]) -> str:
                 out[nr][nc] = "C"
     return "\n".join("".join(row) for row in out)
 
-# ----- Core request handler -----
 def _analyze_map_request(req: Dict[str, Any]) -> Dict[str, Any]:
     grid = _parse_grid(req.get("map", ""))
     if not grid:
@@ -242,10 +227,8 @@ def _analyze_map_request(req: Dict[str, Any]) -> Dict[str, Any]:
         max_time = 2.0
     budget_steps = max(0, math.floor(max_time))
 
-    # build plan (any fixed plan is acceptable; you can replace with something smarter)
     actions = _build_serpentine_plan(R, C, budget_steps)
 
-    # prior from observations and plan-conditioned evaluation
     prior = _prior_from_observations(grid, obs if isinstance(obs, dict) else {})
     success_chance, expected_time = _simulate_plan_success(grid, prior, actions, max_time)
 
@@ -259,7 +242,7 @@ def _analyze_map_request(req: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 def _fallback_observation_only(req: Dict[str, Any]) -> Dict[str, Any]:
-    # No map -> nothing to do; don't guess.
+    # No map -> nothing to do;then don't guess.
     return {"actions": [], "success-chance": 0.0, "expected-time": 0.0}
 
 def agent_function(request_dict: Dict[str, Any], _info: Any) -> Dict[str, Any]:
@@ -268,7 +251,6 @@ def agent_function(request_dict: Dict[str, Any], _info: Any) -> Dict[str, Any]:
     else:
         return _fallback_observation_only(request_dict)
 
-# ----- CLI runner -----
 if __name__ == "__main__":
     try:
         from client import run
