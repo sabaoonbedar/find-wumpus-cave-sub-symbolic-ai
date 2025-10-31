@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+__queue_cache__/
+__queuestorage__/
+__azurite_db_queue__.json
