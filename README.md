@@ -1,4 +1,4 @@
-# Cave-Finding Agent (Find the Wumpus Cave assignment 2.0 (warm up))
+# Cave-Finding Agent (Find the Wumpus Cave)
 
 ## Overview
 
